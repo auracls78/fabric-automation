@@ -1,6 +1,9 @@
 import { auth } from "./js/auth.js";
 
 const app = document.getElementById("app");
+if (typeof window.__API_BASE__ === "undefined") {
+  console.error("config.js is missing: window.__API_BASE__ is undefined");
+}
 
 function navigate(view, data) {
   if (view === "login") renderLogin();
@@ -128,6 +131,12 @@ function renderVerify(data) {
 
 function renderDashboard() {
   const user = auth.getCurrentUser();
+  if (!user || !user.email) {
+    console.error("Invalid auth state: missing currentUser, redirecting to login");
+    auth.logout();
+    navigate("login");
+    return;
+  }
   app.innerHTML = `
     <div class="glass-card dashboard-container">
       <div class="header-actions">

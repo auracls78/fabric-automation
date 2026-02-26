@@ -1,90 +1,113 @@
-const RAW_API_BASE =
-  window.__API_BASE__ ||
-  localStorage.getItem("apiBase") ||
-  `${window.location.protocol}//${window.location.host}`;
-const API_BASE = RAW_API_BASE.replace(/\/+$/, "");
+﻿import { initializeApp, getApp, getApps } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
+import {
+  getAuth,
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  signOut,
+  onAuthStateChanged,
+  sendEmailVerification,
+} from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
 
-async function request(path, options = {}) {
-  const token = localStorage.getItem("authToken");
-  const headers = {
-    "Content-Type": "application/json",
-    ...(options.headers || {}),
-  };
-  if (token) {
-    headers.Authorization = `Bearer ${token}`;
-  }
+const firebaseConfig = window.__FIREBASE_CONFIG__ || null;
 
-  const res = await fetch(`${API_BASE}${path}`, {
-    ...options,
-    headers,
+if (!firebaseConfig) {
+  console.error("Firebase config is missing. Ensure /config.js sets window.__FIREBASE_CONFIG__");
+}
+
+const app = firebaseConfig ? (getApps().length ? getApp() : initializeApp(firebaseConfig)) : null;
+const authClient = app ? getAuth(app) : null;
+
+let currentUserCache = null;
+
+if (authClient) {
+  onAuthStateChanged(authClient, (user) => {
+    currentUserCache = user
+      ? {
+          uid: user.uid,
+          email: user.email || "",
+          emailVerified: Boolean(user.emailVerified),
+        }
+      : null;
+    if (user) {
+      localStorage.setItem("currentUser", JSON.stringify(currentUserCache));
+    } else {
+      localStorage.removeItem("currentUser");
+      localStorage.removeItem("activeBranchId");
+    }
   });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error(data.error || "Request failed");
-  }
-  return data;
+}
+
+function ensureAuth() {
+  if (!authClient) throw new Error("Firebase Auth is not configured");
+}
+
+function normalizeUser(user) {
+  if (!user) return null;
+  return {
+    uid: user.uid,
+    email: user.email || "",
+    emailVerified: Boolean(user.emailVerified),
+  };
 }
 
 export const auth = {
   async register(email, password) {
-    const data = await request("/api/auth/register", {
-      method: "POST",
-      body: JSON.stringify({ email, password }),
-    });
-
-    if (data.verificationCode) {
-      alert(`[SIMULATION] Check your email (${email}) for the code: ${data.verificationCode}`);
+    ensureAuth();
+    const result = await createUserWithEmailAndPassword(authClient, email, password);
+    if (result.user && !result.user.emailVerified) {
+      await sendEmailVerification(result.user).catch(() => {});
     }
-    return true;
+    currentUserCache = normalizeUser(result.user);
+    localStorage.setItem("currentUser", JSON.stringify(currentUserCache));
+    return currentUserCache;
   },
 
-  async verify(email, code) {
-    await request("/api/auth/verify", {
-      method: "POST",
-      body: JSON.stringify({ email, code }),
-    });
+  async verify(_email, _code) {
+    // Kept for backward compatibility with previous flow.
     return true;
   },
 
   async login(email, password) {
-    const data = await request("/api/auth/login", {
-      method: "POST",
-      body: JSON.stringify({ email, password }),
-    });
-    localStorage.setItem("authToken", data.token);
-    localStorage.setItem("currentUser", JSON.stringify(data.user));
-    return data.user;
+    ensureAuth();
+    const result = await signInWithEmailAndPassword(authClient, email, password);
+    currentUserCache = normalizeUser(result.user);
+    localStorage.setItem("currentUser", JSON.stringify(currentUserCache));
+    return currentUserCache;
   },
 
   async logout() {
-    try {
-      await request("/api/auth/logout", { method: "POST" });
-    } catch (_err) {
-      // Ignore network/session errors during logout cleanup.
+    if (authClient) {
+      await signOut(authClient).catch(() => {});
     }
-    localStorage.removeItem("authToken");
+    currentUserCache = null;
     localStorage.removeItem("currentUser");
+    localStorage.removeItem("activeBranchId");
   },
 
   getCurrentUser() {
+    if (currentUserCache) return currentUserCache;
     const raw = localStorage.getItem("currentUser");
-    return raw ? JSON.parse(raw) : null;
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw);
+    } catch (_err) {
+      return null;
+    }
+  },
+
+  getCurrentUserId() {
+    return this.getCurrentUser()?.uid || "";
   },
 
   isAuthenticated() {
-    return !!localStorage.getItem("authToken");
+    return Boolean(this.getCurrentUser());
   },
 
-  async listBranches() {
-    const data = await request("/api/branches");
-    return data.branches || [];
-  },
-
-  async addBranch(name, location) {
-    const data = await request("/api/branches", {
-      method: "POST",
-      body: JSON.stringify({ name, location }),
-    });
-    return data.branch;
+  onAuthChange(callback) {
+    if (!authClient) {
+      callback(null);
+      return () => {};
+    }
+    return onAuthStateChanged(authClient, (user) => callback(normalizeUser(user)));
   },
 };

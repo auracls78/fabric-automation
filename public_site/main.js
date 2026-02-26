@@ -1,229 +1,567 @@
-import { auth } from "./js/auth.js";
+﻿import { auth } from "./js/auth.js";
+import { goTo, getRoute, onRouteChange } from "./js/router.js";
+import { can, defaultPermissions, ROLE } from "./js/permissions.js";
+import {
+  ensureUserDoc,
+  createCompanyForOwner,
+  loadCompanyContext,
+  setActiveBranch,
+  listBranches,
+} from "./js/firestore.js";
+import { createBranchService } from "./js/branches.js";
+import { createStaffService } from "./js/staff.js";
+import { renderAuthScreen, renderOnboarding, renderBranchPicker, renderAppShell } from "./js/ui.js";
+import { toast } from "./js/toast.js";
 
 const app = document.getElementById("app");
 
-function navigate(view, data) {
-  if (view === "login") renderLogin();
-  else if (view === "register") renderRegister();
-  else if (view === "verify") renderVerify(data);
-  else if (view === "dashboard") {
-    if (!auth.isAuthenticated()) {
-      navigate("login");
-      return;
-    }
-    renderDashboard();
+const state = {
+  route: getRoute(),
+  authMode: "login",
+  user: null,
+  userData: null,
+  company: null,
+  staffMe: null,
+  permissions: defaultPermissions(ROLE.OWNER),
+  branches: [],
+  staff: [],
+  activeBranchId: localStorage.getItem("activeBranchId") || "",
+  sidebarOpen: false,
+  loading: false,
+  error: "",
+  staffLoading: false,
+  branchModal: { open: false, mode: "create", id: "", values: { name: "", address: "", status: "inactive" } },
+  staffModal: { open: false, mode: "create", id: "", values: { email: "", role: "CASHIER", branchIds: [] } },
+  deleteModal: { open: false, kind: "", id: "" },
+};
+
+let branchService = null;
+let staffService = null;
+
+function safeError(err) {
+  const msg = err?.message || "Unknown error";
+  if (/permission|denied/i.test(msg)) return "Permission denied for this action.";
+  if (/network|fetch|offline/i.test(msg)) return "Network error. Please retry.";
+  return msg;
+}
+
+function resetModals() {
+  state.branchModal = { open: false, mode: "create", id: "", values: { name: "", address: "", status: "inactive" } };
+  state.staffModal = { open: false, mode: "create", id: "", values: { email: "", role: "CASHIER", branchIds: [] } };
+  state.deleteModal = { open: false, kind: "", id: "" };
+}
+
+async function syncAuthContext() {
+  const user = auth.getCurrentUser();
+  state.user = user;
+  if (!user) {
+    state.userData = null;
+    state.company = null;
+    state.staffMe = null;
+    state.branches = [];
+    state.staff = [];
+    return;
+  }
+
+  await ensureUserDoc(user);
+  const ctx = await loadCompanyContext(user.uid);
+  state.userData = ctx.userData;
+  state.company = ctx.company;
+  state.staffMe = ctx.staffMe;
+  state.branches = ctx.branches;
+
+  if (state.userData?.activeBranchId) {
+    state.activeBranchId = state.userData.activeBranchId;
+    localStorage.setItem("activeBranchId", state.activeBranchId);
+  }
+
+  branchService = state.company ? createBranchService(state.company.id) : null;
+  staffService = state.company ? createStaffService(state.company.id) : null;
+
+  const roleFromUser = state.userData?.role || state.staffMe?.role || ROLE.OWNER;
+  state.permissions = {
+    ...defaultPermissions(roleFromUser),
+    ...(state.staffMe?.permissions || {}),
+  };
+
+  if (state.staffMe && !state.staffMe.permissions) {
+    state.permissions = defaultPermissions(state.staffMe.role || roleFromUser);
   }
 }
 
-function renderLogin() {
-  app.innerHTML = `
-    <div class="glass-card">
-      <h1>Welcome Back</h1>
-      <p class="subtitle">Please enter your details to sign in</p>
-      <form id="loginForm">
-        <div class="form-group">
-          <label>Email Address</label>
-          <input type="email" id="email" required placeholder="name@company.com">
-        </div>
-        <div class="form-group">
-          <label>Password</label>
-          <input type="password" id="password" required placeholder="........">
-        </div>
-        <div id="loginError" class="error-message"></div>
-        <button type="submit">Sign In</button>
-      </form>
-      <div class="footer-text">
-        Don't have an account? <span class="text-link" id="gotoRegister">Sign up</span>
-      </div>
-    </div>
-  `;
+function applyRouteGuards() {
+  const route = state.route;
+  if (!state.user) {
+    if (route !== "/login") goTo("/login");
+    return;
+  }
 
-  document.getElementById("loginForm").addEventListener("submit", async (e) => {
+  if (!state.userData?.companyId) {
+    if (route !== "/onboarding") goTo("/onboarding");
+    return;
+  }
+
+  if (!state.activeBranchId && !["/branches", "/onboarding", "/login"].includes(route)) {
+    goTo("/branches");
+    return;
+  }
+
+  if (route === "/staff" && !can("manageStaff", { role: state.staffMe?.role, permissions: state.permissions })) {
+    goTo("/dashboard");
+    return;
+  }
+
+  if (route === "/settings" && !can("manageCompany", { role: state.staffMe?.role, permissions: state.permissions })) {
+    goTo("/dashboard");
+  }
+}
+
+async function refreshBranches() {
+  if (!state.company) return;
+  state.loading = true;
+  render();
+  try {
+    state.branches = await listBranches(state.company.id);
+    if (!state.activeBranchId || !state.branches.some((b) => b.id === state.activeBranchId)) {
+      state.activeBranchId = state.branches[0]?.id || "";
+      if (state.activeBranchId && state.user) {
+        await setActiveBranch(state.user.uid, state.activeBranchId);
+      }
+    }
+    state.error = "";
+  } catch (err) {
+    state.error = safeError(err);
+  } finally {
+    state.loading = false;
+    render();
+  }
+}
+
+async function refreshStaff() {
+  if (!state.company || !staffService || !can("manageStaff", { role: state.staffMe?.role, permissions: state.permissions })) {
+    state.staff = [];
+    return;
+  }
+  state.staffLoading = true;
+  render();
+  try {
+    state.staff = await staffService.list();
+  } catch (err) {
+    toast(safeError(err), "error");
+  } finally {
+    state.staffLoading = false;
+    render();
+  }
+}
+
+function render() {
+  const route = getRoute();
+  state.route = route;
+
+  if (route === "/login") {
+    app.innerHTML = renderAuthScreen(state.authMode === "signup" ? "signup" : "login");
+    bindAuthScreen();
+    return;
+  }
+
+  if (route === "/onboarding") {
+    app.innerHTML = renderOnboarding();
+    bindOnboarding();
+    return;
+  }
+
+  if (route === "/branches") {
+    app.innerHTML = renderBranchPicker({
+      company: state.company,
+      branches: state.branches,
+      activeBranchId: state.activeBranchId,
+      canManageBranches: can("manageBranches", { role: state.staffMe?.role, permissions: state.permissions }),
+      sidebarOpen: state.sidebarOpen,
+      branchModal: state.branchModal,
+      deleteModal: state.deleteModal,
+      staffModal: state.staffModal,
+    });
+    bindBranchPicker();
+    return;
+  }
+
+  app.innerHTML = renderAppShell({
+    route,
+    company: state.company,
+    branches: state.branches,
+    activeBranchId: state.activeBranchId,
+    sidebarOpen: state.sidebarOpen,
+    loading: state.loading,
+    error: state.error,
+    staff: state.staff,
+    staffLoading: state.staffLoading,
+    permissions: state.permissions,
+    branchModal: state.branchModal,
+    deleteModal: state.deleteModal,
+    staffModal: state.staffModal,
+  });
+
+  bindShell();
+}
+
+function bindAuthScreen() {
+  const form = document.getElementById("authForm");
+  const switcher = document.getElementById("switchAuthMode");
+  const errorNode = document.getElementById("authError");
+
+  switcher?.addEventListener("click", () => {
+    state.authMode = state.authMode === "login" ? "signup" : "login";
+    render();
+  });
+
+  form?.addEventListener("submit", async (e) => {
     e.preventDefault();
-    const email = document.getElementById("email").value;
-    const password = document.getElementById("password").value;
+    errorNode.textContent = "";
+    const email = document.getElementById("authEmail").value.trim();
+    const password = document.getElementById("authPassword").value;
     try {
-      await auth.login(email, password);
-      navigate("dashboard");
+      if (state.authMode === "signup") {
+        await auth.register(email, password);
+        toast("Account created", "success");
+      } else {
+        await auth.login(email, password);
+        toast("Signed in", "success");
+      }
+      await syncAuthContext();
+      applyRouteGuards();
+      render();
     } catch (err) {
-      document.getElementById("loginError").textContent = err.message;
+      errorNode.textContent = safeError(err);
     }
   });
-
-  document.getElementById("gotoRegister").addEventListener("click", () => navigate("register"));
 }
 
-function renderRegister() {
-  app.innerHTML = `
-    <div class="glass-card">
-      <h1>Create Account</h1>
-      <p class="subtitle">Join our fabric automation platform</p>
-      <form id="registerForm">
-        <div class="form-group">
-          <label>Email Address</label>
-          <input type="email" id="regEmail" required placeholder="name@company.com">
-        </div>
-        <div class="form-group">
-          <label>Password</label>
-          <input type="password" id="regPassword" required placeholder="Minimum 8 characters">
-        </div>
-        <div id="regError" class="error-message"></div>
-        <button type="submit">Get Started</button>
-      </form>
-      <div class="footer-text">
-        Already have an account? <span class="text-link" id="gotoLogin">Sign in</span>
-      </div>
-    </div>
-  `;
+function bindOnboarding() {
+  const form = document.getElementById("onboardingForm");
+  const errorNode = document.getElementById("onboardingError");
 
-  document.getElementById("registerForm").addEventListener("submit", async (e) => {
+  form?.addEventListener("submit", async (e) => {
     e.preventDefault();
-    const email = document.getElementById("regEmail").value;
-    const password = document.getElementById("regPassword").value;
+    errorNode.textContent = "";
+
+    const payload = {
+      name: document.getElementById("companyName").value.trim(),
+      phone: document.getElementById("companyPhone").value.trim(),
+      currency: document.getElementById("companyCurrency").value,
+      timezone: document.getElementById("companyTimezone").value,
+    };
+
+    if (!payload.name) {
+      errorNode.textContent = "Company name is required";
+      return;
+    }
+
     try {
-      await auth.register(email, password);
-      navigate("verify", { email });
+      await createCompanyForOwner(state.user, payload);
+      await syncAuthContext();
+      toast("Business created", "success");
+      goTo("/branches");
     } catch (err) {
-      document.getElementById("regError").textContent = err.message;
+      errorNode.textContent = safeError(err);
+    }
+  });
+}
+
+function bindBranchPicker() {
+  document.getElementById("logoutBtn")?.addEventListener("click", doLogout);
+  document.getElementById("toggleSidebarBtn")?.addEventListener("click", () => {
+    state.sidebarOpen = !state.sidebarOpen;
+    render();
+  });
+
+  if (can("manageBranches", { role: state.staffMe?.role, permissions: state.permissions })) {
+    document.getElementById("openCreateBranchBtn")?.addEventListener("click", () => {
+      state.branchModal = { open: true, mode: "create", id: "", values: { name: "", address: "", status: "active" } };
+      render();
+    });
+  }
+
+  app.querySelectorAll("[data-branch-pick]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const branchId = btn.getAttribute("data-branch-pick");
+      if (!branchId || !state.user) return;
+      try {
+        await setActiveBranch(state.user.uid, branchId);
+        state.activeBranchId = branchId;
+        localStorage.setItem("activeBranchId", branchId);
+        toast("Branch selected", "success");
+        goTo("/dashboard");
+      } catch (err) {
+        toast(safeError(err), "error");
+      }
+    });
+  });
+
+  bindBranchModalAndDelete();
+}
+
+function bindShell() {
+  document.getElementById("logoutBtn")?.addEventListener("click", doLogout);
+  document.getElementById("toggleSidebarBtn")?.addEventListener("click", () => {
+    state.sidebarOpen = !state.sidebarOpen;
+    render();
+  });
+
+  document.getElementById("goBranchPickerBtn")?.addEventListener("click", () => goTo("/branches"));
+
+  document.getElementById("activeBranchSelect")?.addEventListener("change", async (e) => {
+    const branchId = e.target.value;
+    if (!branchId || !state.user) return;
+    try {
+      await setActiveBranch(state.user.uid, branchId);
+      state.activeBranchId = branchId;
+      localStorage.setItem("activeBranchId", branchId);
+      toast("Active branch changed", "success");
+      render();
+    } catch (err) {
+      toast(safeError(err), "error");
     }
   });
 
-  document.getElementById("gotoLogin").addEventListener("click", () => navigate("login"));
+  app.querySelectorAll("[data-go]").forEach((btn) => {
+    btn.addEventListener("click", () => goTo(btn.getAttribute("data-go")));
+  });
+
+  document.getElementById("retryBtn")?.addEventListener("click", () => {
+    refreshBranches();
+    if (state.route === "/staff") refreshStaff();
+  });
+
+  if (can("manageBranches", { role: state.staffMe?.role, permissions: state.permissions })) {
+    document.getElementById("openCreateBranchBtn")?.addEventListener("click", () => {
+      state.branchModal = { open: true, mode: "create", id: "", values: { name: "", address: "", status: "active" } };
+      render();
+    });
+  }
+
+  if (can("manageStaff", { role: state.staffMe?.role, permissions: state.permissions })) {
+    document.getElementById("openCreateStaffBtn")?.addEventListener("click", () => {
+      state.staffModal = { open: true, mode: "create", id: "", values: { email: "", role: "CASHIER", branchIds: [] } };
+      render();
+    });
+  }
+
+  app.querySelectorAll("[data-action='activate-branch']").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = btn.getAttribute("data-id");
+      if (!id || !state.user) return;
+      try {
+        await setActiveBranch(state.user.uid, id);
+        state.activeBranchId = id;
+        localStorage.setItem("activeBranchId", id);
+        toast("Branch activated", "success");
+        render();
+      } catch (err) {
+        toast(safeError(err), "error");
+      }
+    });
+  });
+
+  app.querySelectorAll("[data-action='edit-branch']").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-id");
+      const branch = state.branches.find((b) => b.id === id);
+      if (!branch) return;
+      state.branchModal = { open: true, mode: "edit", id, values: { name: branch.name, address: branch.address, status: branch.status } };
+      render();
+    });
+  });
+
+  app.querySelectorAll("[data-action='delete-branch']").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-id");
+      state.deleteModal = { open: true, kind: "branch", id };
+      render();
+    });
+  });
+
+  app.querySelectorAll("[data-action='edit-staff']").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-id");
+      const item = state.staff.find((s) => s.id === id);
+      if (!item) return;
+      state.staffModal = {
+        open: true,
+        mode: "edit",
+        id,
+        values: {
+          email: item.email || "",
+          role: item.role || "CASHIER",
+          branchIds: item.branchIds || [],
+        },
+      };
+      render();
+      const roleSelect = document.getElementById("staffRole");
+      if (roleSelect) roleSelect.value = item.role || "CASHIER";
+    });
+  });
+
+  app.querySelectorAll("[data-action='delete-staff']").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-id");
+      state.deleteModal = { open: true, kind: "staff", id };
+      render();
+    });
+  });
+
+  bindBranchModalAndDelete();
+  bindStaffModal();
 }
 
-function renderVerify(data) {
-  const email = data?.email || "";
-  app.innerHTML = `
-    <div class="glass-card">
-      <h1>Verify Email</h1>
-      <p class="subtitle">Enter the 6-digit code sent to ${email}</p>
-      <form id="verifyForm">
-        <div class="form-group">
-          <label>Verification Code</label>
-          <input type="text" id="verifyCode" required minlength="6" maxlength="6" placeholder="123456">
-        </div>
-        <div id="verifyError" class="error-message"></div>
-        <button type="submit">Verify</button>
-      </form>
-      <div class="footer-text">
-        Wrong email? <span class="text-link" id="backToRegister">Go back</span>
-      </div>
-    </div>
-  `;
+function bindBranchModalAndDelete() {
+  document.getElementById("closeBranchModalBtn")?.addEventListener("click", () => {
+    state.branchModal.open = false;
+    render();
+  });
 
-  document.getElementById("verifyForm").addEventListener("submit", async (e) => {
+  document.getElementById("branchForm")?.addEventListener("submit", async (e) => {
     e.preventDefault();
-    const code = document.getElementById("verifyCode").value;
+    if (!branchService) return;
+    const errorNode = document.getElementById("branchFormError");
+    const name = document.getElementById("branchName").value.trim();
+    const address = document.getElementById("branchAddress").value.trim();
+    const status = document.getElementById("branchStatus").value;
+
+    if (!name) {
+      errorNode.textContent = "Branch name is required";
+      return;
+    }
+
     try {
-      await auth.verify(email, code);
-      alert("Email verified successfully! You can now log in.");
-      navigate("login");
+      if (state.branchModal.mode === "edit") {
+        await branchService.update(state.branchModal.id, { name, address, status });
+        toast("Branch updated", "success");
+      } else {
+        const branchId = await branchService.create({ name, address, status });
+        toast("Branch created", "success");
+        if (!state.activeBranchId && state.user) {
+          await setActiveBranch(state.user.uid, branchId);
+          state.activeBranchId = branchId;
+        }
+      }
+      state.branchModal.open = false;
+      await refreshBranches();
     } catch (err) {
-      document.getElementById("verifyError").textContent = err.message;
+      errorNode.textContent = safeError(err);
     }
   });
 
-  document.getElementById("backToRegister").addEventListener("click", () => navigate("register"));
+  document.getElementById("cancelDeleteBtn")?.addEventListener("click", () => {
+    state.deleteModal.open = false;
+    render();
+  });
+
+  document.getElementById("confirmDeleteBtn")?.addEventListener("click", async () => {
+    if (!state.deleteModal.open) return;
+    try {
+      if (state.deleteModal.kind === "branch" && branchService) {
+        await branchService.remove(state.deleteModal.id);
+        if (state.activeBranchId === state.deleteModal.id) {
+          state.activeBranchId = "";
+          localStorage.removeItem("activeBranchId");
+        }
+        toast("Branch deleted", "success");
+        await refreshBranches();
+      }
+      if (state.deleteModal.kind === "staff" && staffService) {
+        await staffService.remove(state.deleteModal.id);
+        toast("Staff deleted", "success");
+        await refreshStaff();
+      }
+      state.deleteModal.open = false;
+      render();
+    } catch (err) {
+      toast(safeError(err), "error");
+    }
+  });
 }
 
-function renderDashboard() {
-  const user = auth.getCurrentUser();
-  app.innerHTML = `
-    <div class="glass-card dashboard-container">
-      <div class="header-actions">
-        <h1>My Company</h1>
-        <button class="btn-secondary btn-sm" id="logoutBtn">Logout</button>
-      </div>
-      <p class="subtitle">Welcome, ${user.email}. Manage your branches below.</p>
-
-      <div class="header-actions" style="margin-top: 2rem;">
-        <h2 style="font-size: 1.25rem;">Branches</h2>
-        <button class="btn-sm" id="addBranchBtn">+ Add Branch</button>
-      </div>
-
-      <div id="branchList" class="branch-list"></div>
-    </div>
-
-    <div id="branchModal" style="display:none; position: fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:10; justify-content:center; align-items:center;">
-      <div class="glass-card" style="max-width: 400px; width: 90%;">
-        <h2>Add New Branch</h2>
-        <form id="branchForm" style="margin-top: 1.5rem;">
-          <div class="form-group">
-            <label>Branch Name</label>
-            <input type="text" id="branchName" required placeholder="Main Street Branch">
-          </div>
-          <div class="form-group">
-            <label>Location</label>
-            <input type="text" id="branchLocation" required placeholder="City Center, 123">
-          </div>
-          <div style="display:flex; gap: 1rem;">
-            <button type="button" class="btn-secondary" id="closeModal">Cancel</button>
-            <button type="submit">Save Branch</button>
-          </div>
-        </form>
-      </div>
-    </div>
-  `;
-
-  const branchList = document.getElementById("branchList");
-  const branchModal = document.getElementById("branchModal");
-
-  const refreshBranches = async () => {
-    try {
-      const branches = await auth.listBranches();
-      branchList.innerHTML = branches.length
-        ? ""
-        : '<p style="text-align:center; color:var(--text-dim);">No branches added yet.</p>';
-
-      branches.forEach((branch) => {
-        const div = document.createElement("div");
-        div.className = "branch-item";
-        div.innerHTML = `
-          <div>
-            <div style="font-weight:600;">${branch.name}</div>
-            <div style="font-size:0.8rem; color:var(--text-dim);">${branch.location}</div>
-          </div>
-          <div style="font-size:0.75rem; background:rgba(99, 102, 241, 0.2); padding:0.25rem 0.5rem; border-radius:8px; color:var(--primary);">Active</div>
-        `;
-        branchList.appendChild(div);
-      });
-    } catch (err) {
-      branchList.innerHTML = `<p class="error-message">${err.message}</p>`;
-    }
-  };
-
-  refreshBranches();
-
-  document.getElementById("logoutBtn").addEventListener("click", async () => {
-    await auth.logout();
-    navigate("login");
+function bindStaffModal() {
+  document.getElementById("closeStaffModalBtn")?.addEventListener("click", () => {
+    state.staffModal.open = false;
+    render();
   });
 
-  document.getElementById("addBranchBtn").addEventListener("click", () => {
-    branchModal.style.display = "flex";
-  });
-
-  document.getElementById("closeModal").addEventListener("click", () => {
-    branchModal.style.display = "none";
-  });
-
-  document.getElementById("branchForm").addEventListener("submit", async (e) => {
+  document.getElementById("staffForm")?.addEventListener("submit", async (e) => {
     e.preventDefault();
-    const name = document.getElementById("branchName").value;
-    const location = document.getElementById("branchLocation").value;
+    if (!staffService) return;
+    const errorNode = document.getElementById("staffFormError");
+    const email = document.getElementById("staffEmail").value.trim();
+    const role = document.getElementById("staffRole").value;
+    const branchIds = [...app.querySelectorAll("[data-branch-checkbox]:checked")].map((el) => el.value);
+
+    if (!email) {
+      errorNode.textContent = "Email is required";
+      return;
+    }
+
+    const permissions = defaultPermissions(role);
     try {
-      await auth.addBranch(name, location);
-      branchModal.style.display = "none";
-      e.target.reset();
-      refreshBranches();
+      if (state.staffModal.mode === "edit") {
+        await staffService.update(state.staffModal.id, { email, role, permissions, branchIds, status: "active" });
+        toast("Staff updated", "success");
+      } else {
+        await staffService.create({ email, role, permissions, branchIds, status: "invited" });
+        toast("Staff invited", "success");
+      }
+      state.staffModal.open = false;
+      await refreshStaff();
     } catch (err) {
-      alert(err.message);
+      errorNode.textContent = safeError(err);
     }
   });
+
+  const roleSelect = document.getElementById("staffRole");
+  if (roleSelect && state.staffModal.values.role) {
+    roleSelect.value = state.staffModal.values.role;
+  }
 }
 
-if (auth.isAuthenticated()) {
-  navigate("dashboard");
-} else {
-  navigate("login");
+async function doLogout() {
+  await auth.logout();
+  toast("Logged out", "info");
+  goTo("/login");
 }
+
+async function init() {
+  state.loading = true;
+  render();
+
+  try {
+    await syncAuthContext();
+    applyRouteGuards();
+    if (state.company) {
+      await refreshBranches();
+      if (state.route === "/staff") {
+        await refreshStaff();
+      }
+    }
+  } catch (err) {
+    state.error = safeError(err);
+    toast(state.error, "error");
+  } finally {
+    state.loading = false;
+    render();
+  }
+}
+
+onRouteChange(async (route) => {
+  state.route = route;
+  applyRouteGuards();
+  if (state.route === "/staff") {
+    await refreshStaff();
+  }
+  render();
+});
+
+auth.onAuthChange(async (user) => {
+  state.user = user;
+  await init();
+});
+
+init();

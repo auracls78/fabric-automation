@@ -1,0 +1,148 @@
+﻿rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function userPath(uid) {
+      return /databases/$(database)/documents/users/$(uid);
+    }
+
+    function myUserExists() {
+      return isSignedIn() && exists(userPath(request.auth.uid));
+    }
+
+    function myUser() {
+      return get(userPath(request.auth.uid)).data;
+    }
+
+    function myCompanyId() {
+      return myUserExists() ? myUser().companyId : null;
+    }
+
+    function myStaffId() {
+      return myUserExists() ? myUser().staffId : null;
+    }
+
+    function myStaffPath(companyId) {
+      return /databases/$(database)/documents/companies/$(companyId)/staff/$(myStaffId());
+    }
+
+    function myStaffExists(companyId) {
+      return myStaffId() != null && exists(myStaffPath(companyId));
+    }
+
+    function myStaff(companyId) {
+      return get(myStaffPath(companyId)).data;
+    }
+
+    function isCompanyMember(companyId) {
+      return myCompanyId() == companyId;
+    }
+
+    function isOwner(companyId) {
+      return isCompanyMember(companyId) && (
+        myUser().role == "OWNER" ||
+        (myStaffExists(companyId) && myStaff(companyId).role == "OWNER")
+      );
+    }
+
+    function hasPermission(companyId, perm) {
+      return isCompanyMember(companyId) && (
+        isOwner(companyId) ||
+        (myStaffExists(companyId) && myStaff(companyId).permissions[perm] == true)
+      );
+    }
+
+    function canAccessBranch(companyId, branchId) {
+      return isCompanyMember(companyId) && (
+        hasPermission(companyId, "manageBranches") ||
+        (myStaffExists(companyId) && myStaff(companyId).branchIds.hasAny([branchId]))
+      );
+    }
+
+    function validRole(role) {
+      return role in ["OWNER", "ADMIN", "MANAGER", "CASHIER", "STOCKER", "VIEWER"];
+    }
+
+    match /users/{uid} {
+      allow read: if isSignedIn() && request.auth.uid == uid;
+
+      allow create: if isSignedIn()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly([
+          "email", "role", "companyId", "staffId", "activeBranchId", "createdAt", "updatedAt"
+        ])
+        && validRole(request.resource.data.role);
+
+      allow update: if isSignedIn()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly([
+          "email", "role", "companyId", "staffId", "activeBranchId", "createdAt", "updatedAt"
+        ])
+        && (
+          request.resource.data.role == resource.data.role ||
+          (resource.data.role == null && request.resource.data.role == "OWNER")
+        )
+        && (
+          request.resource.data.companyId == resource.data.companyId ||
+          (resource.data.companyId == null && request.resource.data.companyId == uid)
+        )
+        && (
+          request.resource.data.staffId == resource.data.staffId ||
+          (resource.data.staffId == null && request.resource.data.staffId == uid)
+        );
+
+      allow delete: if false;
+    }
+
+    match /companies/{companyId} {
+      allow read: if isSignedIn() && isCompanyMember(companyId);
+
+      allow create: if isSignedIn()
+        && request.auth.uid == companyId
+        && request.resource.data.ownerUid == request.auth.uid;
+
+      allow update: if isSignedIn() && hasPermission(companyId, "manageCompany");
+      allow delete: if isSignedIn() && isOwner(companyId);
+
+      match /branches/{branchId} {
+        allow read: if isSignedIn() && canAccessBranch(companyId, branchId);
+        allow create: if isSignedIn() && hasPermission(companyId, "manageBranches");
+        allow update: if isSignedIn() && hasPermission(companyId, "manageBranches");
+        allow delete: if isSignedIn() && hasPermission(companyId, "manageBranches");
+      }
+
+      match /staff/{staffId} {
+        allow get: if isSignedIn() && (
+          hasPermission(companyId, "manageStaff") ||
+          staffId == myStaffId()
+        );
+
+        allow list: if isSignedIn() && hasPermission(companyId, "manageStaff");
+
+        allow create: if isSignedIn()
+          && hasPermission(companyId, "manageStaff")
+          && request.resource.data.keys().hasOnly([
+            "email", "userUid", "role", "permissions", "branchIds", "status", "createdAt", "updatedAt"
+          ])
+          && validRole(request.resource.data.role);
+
+        allow update: if isSignedIn()
+          && hasPermission(companyId, "manageStaff")
+          && request.resource.data.keys().hasOnly([
+            "email", "userUid", "role", "permissions", "branchIds", "status", "createdAt", "updatedAt"
+          ])
+          && validRole(request.resource.data.role);
+
+        allow delete: if isSignedIn() && hasPermission(companyId, "manageStaff");
+      }
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
